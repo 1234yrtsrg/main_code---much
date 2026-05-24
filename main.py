@@ -243,13 +243,49 @@ def run_gpu_queue(script_path, data_path, shared_values, gpu_id, n_jobs, run_out
     return completed_files
 
 
-def export_sweep_summary(summary_output, run_output_dir):
+def is_summary_csv_complete(summary_path, shared_value):
+    import pandas as pd
+
+    summary_path = Path(summary_path)
+    if not summary_path.exists() or summary_path.stat().st_size == 0:
+        return False
+
+    try:
+        summary_df = pd.read_csv(summary_path)
+    except Exception:
+        return False
+
+    if summary_df.empty:
+        return False
+
+    required_cols = {"SharedMaxFeatures", "Target", "Model"}
+    if not required_cols.issubset(summary_df.columns):
+        return False
+
+    try:
+        saved_values = set(summary_df["SharedMaxFeatures"].dropna().astype(int).unique())
+    except (TypeError, ValueError):
+        return False
+
+    return saved_values == {int(shared_value)}
+
+
+def export_sweep_summary(summary_output, run_output_dir, shared_values=None):
     import pandas as pd
     from pipeline.reporter import ResultReporter
 
     run_output_dir = Path(run_output_dir)
     summary_dir = run_output_dir / "partials"
-    summary_files = sorted(summary_dir.glob("summary_*.csv"))
+
+    if shared_values is None:
+        summary_files = sorted(summary_dir.glob("summary_*.csv"))
+    else:
+        summary_files = [summary_dir / f"summary_{shared_value:03d}.csv" for shared_value in shared_values]
+        missing_files = [summary_file for summary_file in summary_files if not summary_file.exists()]
+        if missing_files:
+            missing_names = ", ".join(summary_file.name for summary_file in missing_files)
+            raise RuntimeError(f"Missing summary CSV files before export: {missing_names}")
+
     if not summary_files:
         raise RuntimeError(f"No summary CSV files were produced under: {summary_dir}")
 
@@ -263,6 +299,20 @@ def export_sweep_summary(summary_output, run_output_dir):
     print(f"[*] Combined CSV summary: {combined_csv_path}", flush=True)
 
 
+def get_missing_shared_values(summary_dir, shared_values):
+    missing_values = []
+    completed_values = []
+
+    for shared_value in shared_values:
+        summary_path = summary_dir / f"summary_{shared_value:03d}.csv"
+        if is_summary_csv_complete(summary_path, shared_value):
+            completed_values.append(shared_value)
+        else:
+            missing_values.append(shared_value)
+
+    return completed_values, missing_values
+
+
 def run_sweep(args):
     shared_values = list(range(args.sweep_start, args.sweep_end + 1, args.sweep_step))
     if not shared_values:
@@ -274,20 +324,25 @@ def run_sweep(args):
     summary_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    for old_summary in summary_dir.glob("summary_*.csv"):
-        old_summary.unlink()
-    for old_log in log_dir.glob("shared_*.log"):
-        old_log.unlink()
-
     print(f"[*] Sweep Range: {shared_values[0]} -> {shared_values[-1]} (step={args.sweep_step})", flush=True)
     print(f"[*] GPUs: {args.gpu_ids}", flush=True)
     print(f"[*] Summary Output: {args.summary_output}", flush=True)
     print(f"[*] Sweep Run Dir: {args.run_output_dir}", flush=True)
 
+    completed_values, missing_values = get_missing_shared_values(summary_dir, shared_values)
+    print(f"[*] Completed summaries detected: {len(completed_values)}/{len(shared_values)}", flush=True)
+
+    if not missing_values:
+        print("[*] All requested summaries already exist. Exporting combined summary only.", flush=True)
+        export_sweep_summary(args.summary_output, args.run_output_dir, shared_values=shared_values)
+        return
+
+    print(f"[*] Missing or incomplete SHARED_MAX_FEATURES values: {missing_values}", flush=True)
+
     assignments = {
-        gpu_id: shared_values[offset::len(args.gpu_ids)]
+        gpu_id: missing_values[offset::len(args.gpu_ids)]
         for offset, gpu_id in enumerate(args.gpu_ids)
-        if shared_values[offset::len(args.gpu_ids)]
+        if missing_values[offset::len(args.gpu_ids)]
     }
 
     script_path = CURRENT_DIR / "main.py"
@@ -309,12 +364,13 @@ def run_sweep(args):
         for future in as_completed(futures):
             completed_files.extend(future.result())
 
-    if len(completed_files) != len(shared_values):
+    _, remaining_missing_values = get_missing_shared_values(summary_dir, shared_values)
+    if remaining_missing_values:
         raise RuntimeError(
-            f"Expected {len(shared_values)} summary files, but only collected {len(completed_files)}."
+            f"Still missing summary CSV files for SHARED_MAX_FEATURES={remaining_missing_values}."
         )
 
-    export_sweep_summary(args.summary_output, args.run_output_dir)
+    export_sweep_summary(args.summary_output, args.run_output_dir, shared_values=shared_values)
 
 
 def run_single(args):
